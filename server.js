@@ -132,7 +132,7 @@ async function findEmail(username) {
   let name = null;
   let avatar = null;
 
-  // Step 1: Check profile
+  // ── Step 1: Check profile ──
   const profileRes = await fetch(`https://api.github.com/users/${username}`, { headers });
   if (profileRes.status === 404) throw new Error("User not found on GitHub.");
   if (!profileRes.ok) throw new Error(`GitHub API error: ${profileRes.status}`);
@@ -142,7 +142,7 @@ async function findEmail(username) {
   avatar = profile.avatar_url;
   if (profile.email) addEmail(emailSet, profile.email, "profile");
 
-  // Step 2: Check public events
+  // ── Step 2: Check public events ──
   const eventsRes = await fetch(
     `https://api.github.com/users/${username}/events/public?per_page=100`,
     { headers }
@@ -153,30 +153,54 @@ async function findEmail(username) {
       if (event.type === "PushEvent" && event.payload?.commits) {
         for (const commit of event.payload.commits) {
           if (commit.author?.email) {
-            addEmail(emailSet, commit.author.email, "commit event");
+            addEmail(emailSet, commit.author.email, "recent commit");
           }
         }
       }
     }
   }
 
-  // Return early if we found emails
+  // ── Step 3: GitHub commit search API (searches ALL public repos, sorted oldest first) ──
+  // Oldest commits are most likely to predate email privacy settings
+  const searchHeaders = { ...headers, Accept: "application/vnd.github.cloak-preview+json" };
+  for (const order of ["asc", "desc"]) {
+    const searchRes = await fetch(
+      `https://api.github.com/search/commits?q=author:${username}&sort=author-date&order=${order}&per_page=20`,
+      { headers: searchHeaders }
+    );
+    if (searchRes.ok) {
+      const searchData = await searchRes.json();
+      for (const item of searchData.items || []) {
+        // Check the commit author email from the API response
+        if (item.commit?.author?.email) {
+          addEmail(emailSet, item.commit.author.email, order === "asc" ? "early commit" : "recent commit");
+        }
+        if (item.commit?.committer?.email) {
+          addEmail(emailSet, item.commit.committer.email, order === "asc" ? "early commit" : "recent commit");
+        }
+      }
+    }
+    // If we found emails from the oldest commits, no need to check newest too
+    if (emailSet.size > 0 && order === "asc") break;
+  }
+
   if (emailSet.size > 0) {
     return { emails: mapToArray(emailSet), name, avatar };
   }
 
-  // Step 3: Fall back to .patch method
+  // ── Step 4: Deep .patch scan across repos (including forks, multiple commits per repo) ──
+  // Fetch up to 30 repos, including forks this time
   const reposRes = await fetch(
-    `https://api.github.com/users/${username}/repos?sort=updated&per_page=10`,
+    `https://api.github.com/users/${username}/repos?sort=pushed&per_page=30`,
     { headers }
   );
   if (reposRes.ok) {
     const repos = await reposRes.json();
-    for (const repo of repos) {
-      if (repo.fork) continue;
 
+    for (const repo of repos) {
+      // Get up to 20 commits per repo, sorted oldest first to find pre-privacy emails
       const commitsRes = await fetch(
-        `https://api.github.com/repos/${repo.full_name}/commits?author=${username}&per_page=1`,
+        `https://api.github.com/repos/${repo.full_name}/commits?author=${username}&per_page=20`,
         { headers }
       );
       if (!commitsRes.ok) continue;
@@ -184,18 +208,35 @@ async function findEmail(username) {
       const commits = await commitsRes.json();
       if (commits.length === 0) continue;
 
-      const sha = commits[0].sha;
-      const patchRes = await fetch(
-        `https://github.com/${repo.full_name}/commit/${sha}.patch`,
-        { headers: { "User-Agent": "github-email-bot" }, redirect: "follow" }
-      );
-      if (!patchRes.ok) continue;
+      // Check commits from oldest to newest (reverse the array)
+      const orderedCommits = [...commits].reverse();
 
-      const patchText = await patchRes.text();
-      const fromMatch = patchText.match(/^From:.*<(.+?)>/m);
-      if (fromMatch) addEmail(emailSet, fromMatch[1], "commit patch");
+      for (const commit of orderedCommits) {
+        // First try the API commit data directly
+        if (commit.commit?.author?.email) {
+          addEmail(emailSet, commit.commit.author.email, `patch: ${repo.name}`);
+        }
+        if (commit.commit?.committer?.email) {
+          addEmail(emailSet, commit.commit.committer.email, `patch: ${repo.name}`);
+        }
 
-      if (emailSet.size > 0) break;
+        // If API data was noreply, try the .patch method on this commit
+        if (emailSet.size === 0) {
+          const patchRes = await fetch(
+            `https://github.com/${repo.full_name}/commit/${commit.sha}.patch`,
+            { headers: { "User-Agent": "github-email-bot" }, redirect: "follow" }
+          );
+          if (patchRes.ok) {
+            const patchText = await patchRes.text();
+            const fromMatch = patchText.match(/^From:.*<(.+?)>/m);
+            if (fromMatch) addEmail(emailSet, fromMatch[1], `patch: ${repo.name}`);
+          }
+        }
+
+        if (emailSet.size > 0) break; // found one in this repo
+      }
+
+      if (emailSet.size > 0) break; // found one, stop scanning repos
     }
   }
 
