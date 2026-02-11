@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: git-email-plz
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
